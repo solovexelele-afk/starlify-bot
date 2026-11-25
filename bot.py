@@ -149,7 +149,8 @@ def send(chat, text, kb=None):
     if kb: p['reply_markup'] = {'inline_keyboard': kb}
     return tg('sendMessage', **p)
 
-WALLET_BTN = [[{'text': 'Открыть Starlify Wallet', 'url': WALLET_URL}]]
+# Mini App: кошелёк открывается прямо внутри Telegram
+WALLET_BTN = [[{'text': 'Открыть Starlify Wallet', 'web_app': {'url': WALLET_URL}}]]
 H = html.escape
 
 def is_admin(u): return (u.get('username') or '').lower() in ADMINS
@@ -375,6 +376,7 @@ def main():
         r = tg('setWebhook', url=f'{PUBLIC_URL}/tg/{WEBHOOK_SECRET}', secret_token=WEBHOOK_SECRET,
                allowed_updates=['message', 'callback_query'], drop_pending_updates=False)
         log('webhook:', r.get('ok'), r.get('description', ''))
+        tg('setChatMenuButton', menu_button={'type': 'web_app', 'text': 'Кошелёк', 'web_app': {'url': WALLET_URL}})
         tg('setMyCommands', commands=[{'command': 'start', 'description': 'Начать'}, {'command': 'list', 'description': 'Мои адреса'},
                                       {'command': 'help', 'description': 'Помощь'}])
     elif not TOKEN:
