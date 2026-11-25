@@ -52,8 +52,16 @@ class DB:
         # кошельки, которые открывали Starlify Wallet (отмечаются при каждом открытии)
         self.run("""CREATE TABLE IF NOT EXISTS wallets (raw TEXT PRIMARY KEY, net TEXT, ver TEXT, src TEXT, tg_id BIGINT,
                     first_seen BIGINT, last_seen BIGINT, opens INTEGER DEFAULT 0)""")
+        # журнал входов: каждое открытие кошелька (устройство, IP, баланс, время)
+        self.run(f"""CREATE TABLE IF NOT EXISTS logins (id {auto} PRIMARY KEY, raw TEXT, net TEXT, src TEXT,
+                    device TEXT, ip TEXT, tg_id BIGINT, bal REAL, at BIGINT)""")
+        try: self.run('CREATE INDEX IF NOT EXISTS idx_logins_raw ON logins (raw, id)')
+        except Exception: pass
         for col, ddl in (('notify', 'INTEGER DEFAULT 1'), ('scam_alerts', 'INTEGER DEFAULT 0'), ('min_ton', 'REAL DEFAULT 0')):
             try: self.run(f'ALTER TABLE users ADD COLUMN {col} {ddl}')
+            except Exception: pass
+        for col, ddl in (('device', 'TEXT'), ('ip', 'TEXT'), ('bal', 'REAL')):
+            try: self.run(f'ALTER TABLE wallets ADD COLUMN {col} {ddl}')
             except Exception: pass
 
     def run(self, sql, args=(), fetch=False):
@@ -88,16 +96,25 @@ def tg_user_from_init(init):
         return json.loads(pairs.get('user', 'null'))
     except Exception: return None
 
-def wallet_seen(raw, net='mainnet', ver='', src='web', tg_user=None):
+def wallet_seen(raw, net='mainnet', ver='', src='web', tg_user=None, device='', ip='', bal=None):
     t = now(); tg_id = None
     if tg_user and tg_user.get('id'):
         tg_id = int(tg_user['id']); touch_user(tg_user)
+    # перезагрузка страницы не считается новым входом: обновляем запись, если то же устройство заходило < 5 минут назад
+    last = db.one('SELECT id, at FROM logins WHERE raw=? AND device=? ORDER BY id DESC LIMIT 1', (raw, device))
+    fresh = not (last and t - (last[1] or 0) < 300)
+    if fresh:
+        db.run('INSERT INTO logins (raw, net, src, device, ip, tg_id, bal, at) VALUES (?,?,?,?,?,?,?,?)', (raw, net, src, device, ip, tg_id, bal, t))
+        db.run('DELETE FROM logins WHERE raw=? AND id NOT IN (SELECT id FROM logins WHERE raw=? ORDER BY id DESC LIMIT 40)', (raw, raw))
+    elif last:
+        db.run('UPDATE logins SET at=?, ip=?, bal=?, src=? WHERE id=?', (t, ip, bal, src, last[0]))
     if db.one('SELECT raw FROM wallets WHERE raw=?', (raw,)):
-        db.run('UPDATE wallets SET last_seen=?, opens=opens+1, net=?, ver=COALESCE(NULLIF(?, ''), ver), src=?, tg_id=COALESCE(?, tg_id) WHERE raw=?',
-               (t, net, ver, src, tg_id, raw))
+        db.run("UPDATE wallets SET last_seen=?, opens=opens+?, net=?, ver=COALESCE(NULLIF(?, ''), ver), src=?, "
+               'tg_id=COALESCE(?, tg_id), device=?, ip=?, bal=? WHERE raw=?',
+               (t, 1 if fresh else 0, net, ver, src, tg_id, device, ip, bal, raw))
     else:
-        db.run('INSERT INTO wallets (raw, net, ver, src, tg_id, first_seen, last_seen, opens) VALUES (?,?,?,?,?,?,?,1)',
-               (raw, net, ver, src, tg_id, t, t))
+        db.run('INSERT INTO wallets (raw, net, ver, src, tg_id, first_seen, last_seen, opens, device, ip, bal) VALUES (?,?,?,?,?,?,?,1,?,?,?)',
+               (raw, net, ver, src, tg_id, t, t, device, ip, bal))
 
 def bump_notifications(n=1):
     d = time.strftime('%Y-%m-%d')
@@ -429,18 +446,20 @@ def adm_wallets(page):
             'Здесь все адреса, которые открывали кошелёк (сайт, приложение или Mini App). Нажми на кошелёк, чтобы открыть карточку и забанить')
     return text, kb
 
+SRC_NAME = {'tg': 'Mini App в Telegram', 'app': 'приложение', 'web': 'сайт'}
+
 def adm_wallet(raw):
-    w = db.one('SELECT net, ver, src, tg_id, first_seen, last_seen, opens FROM wallets WHERE raw=?', (raw,))
+    w = db.one('SELECT net, ver, src, tg_id, first_seen, last_seen, opens, device, ip, bal FROM wallets WHERE raw=?', (raw,))
     ban = db.one('SELECT reason, at FROM banned_addrs WHERE raw=?', (raw,))
     owners = db.run('SELECT DISTINCT u.tg_id, u.username, u.first_name FROM users u WHERE u.tg_id IN (SELECT tg_id FROM addrs WHERE raw=?) OR u.tg_id=?',
                     (raw, w[3] if w and w[3] else -1), fetch=True)
     fa = friendly(raw)
     lines = [f'💼 <b>Кошелёк</b>\n<code>{fa}</code>']
     if w:
-        src = {'tg': 'Mini App в Telegram', 'app': 'приложение', 'web': 'сайт'}.get(w[2], w[2] or '—')
-        lines.append(f'Сеть: {w[0]} · версия: {w[1] or "—"} · откуда: {src}\n'
+        lines.append(f'Сеть: {w[0]} · версия: {w[1] or "—"} · откуда: {SRC_NAME.get(w[2], w[2] or "—")}\n'
+                     f'Устройство: {H(w[7] or "—")}' + (f' · IP {H(w[8])}' if w[8] else '') + '\n'
                      f'Первый вход: {time.strftime("%d.%m.%Y %H:%M", time.localtime(w[4] or 0))}\n'
-                     f'Последний: {time.strftime("%d.%m.%Y %H:%M", time.localtime(w[5] or 0))} · открытий: {w[6]}')
+                     f'Последний: {time.strftime("%d.%m.%Y %H:%M", time.localtime(w[5] or 0))} · входов: {w[6]}')
     else: lines.append('В кошельке Starlify этот адрес не открывали')
     if not w or w[0] != 'testnet':
         try:
@@ -449,11 +468,26 @@ def adm_wallet(raw):
         except Exception: lines.append('Баланс: не удалось получить')
     lines.append('Telegram: ' + (', '.join(f'{H(o[2] or "—")}' + (f' @{H(o[1])}' if o[1] else '') + f' <code>{o[0]}</code>' for o in owners) or 'не связан'))
     lines.append('Статус: ' + (f'🚫 забанен' + (f' — {H(ban[0])}' if ban and ban[0] else '') if ban else '✅ активен'))
-    kb = [[B('✅ Разбанить', f'ad:wunban:{fa}') if ban else B('🚫 Забанить кошелёк', f'ad:wban:{fa}')],
-          [{'text': '🔍 Tonviewer', 'url': f'https://tonviewer.com/{fa}'}]]
+    kb = [[B('✅ Разбанить', f'ad:wunban:{fa}') if ban else B('🚫 Забанить кошелёк', f'ad:wban:{fa}')]]
+    if w: kb.append([B('📜 История входов', f'ad:lg:{fa}:0')])
+    kb.append([{'text': '🔍 Tonviewer', 'url': f'https://tonviewer.com/{fa}'}])
     kb += [[B(f'👤 {(o[2] or str(o[0]))[:20]}', f'ad:u:{o[0]}')] for o in owners[:3]]
     kb.append([B('‹ Кошельки', 'ad:wl:0'), B('‹ Админка', 'ad:home')])
     return '\n'.join(lines), kb
+
+def adm_logins(raw, page):
+    fa = friendly(raw)
+    total = db.one('SELECT count(*) FROM logins WHERE raw=?', (raw,))[0]
+    rows = db.run('SELECT at, device, ip, src, bal FROM logins WHERE raw=? ORDER BY id DESC LIMIT ? OFFSET ?', (raw, PAGE, page * PAGE), fetch=True)
+    lines = [f'📜 <b>История входов</b>\n<code>{short(fa)}</code> · всего {total}\n']
+    for at, dev, ip, src, bal in rows:
+        lines.append(f'• {time.strftime("%d.%m.%Y %H:%M", time.localtime(at or 0))} · {H(dev or "—")} · {SRC_NAME.get(src, src or "—")}'
+                     + (f' · {fmt(bal)} TON' if bal is not None else '') + (f'\n  IP {H(ip)}' if ip else ''))
+    nav = []
+    if page > 0: nav.append(B('‹', f'ad:lg:{fa}:{page - 1}'))
+    if (page + 1) * PAGE < total: nav.append(B('›', f'ad:lg:{fa}:{page + 1}'))
+    kb = ([nav] if nav else []) + [[B('‹ Кошелёк', f'ad:w:{fa}'), B('‹ Админка', 'ad:home')]]
+    return ('\n'.join(lines) if rows else '📜 Входов пока нет'), kb
 
 def ban_wallet(raw, reason=''):
     db.run('DELETE FROM banned_addrs WHERE raw=?', (raw,))
@@ -514,6 +548,9 @@ def admin_callback(chat, mid, u, data):
     elif parts[1] == 'u': t, kb = adm_card(int(parts[2]))
     elif data == 'ad:banned': t, kb = adm_banned()
     elif parts[1] == 'wl': t, kb = adm_wallets(int(parts[2]))
+    elif parts[1] == 'lg':
+        raw = parse_address(parts[2])
+        t, kb = adm_logins(raw, int(parts[3])) if raw else ('Неверный адрес', [[B('‹ Админка', 'ad:home')]])
     elif parts[1] in ('w', 'wban', 'wbanok', 'wunban'):
         raw = parse_address(parts[2])
         if not raw: t, kb = 'Неверный адрес', [[B('‹ Админка', 'ad:home')]]
@@ -670,14 +707,17 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {'error': 'not found'})
     def do_POST(self):
         if self.path == '/api/check':
-            # кошелёк отмечается при открытии: {a, net, ver, src, init}; body text/plain, чтобы обойтись без preflight
+            # кошелёк отмечается при открытии: {a, net, ver, src, dev, bal, init}; body text/plain, чтобы обойтись без preflight
             n = min(int(self.headers.get('Content-Length', '0')), 8192)
             try: d = json.loads(self.rfile.read(n) or b'{}')
             except Exception: d = {}
             raw = parse_address(str(d.get('a', '')))
             if not raw: return self._json(400, {'error': 'bad address'})
             net = 'testnet' if d.get('net') == 'testnet' else 'mainnet'
-            try: wallet_seen(raw, net, str(d.get('ver', ''))[:8], str(d.get('src', 'web'))[:8], tg_user_from_init(str(d.get('init', ''))[:4096]))
+            ip = (self.headers.get('X-Forwarded-For', '') or self.client_address[0]).split(',')[0].strip()[:45]
+            bal = d.get('bal'); bal = round(float(bal), 9) if isinstance(bal, (int, float)) else None
+            try: wallet_seen(raw, net, str(d.get('ver', ''))[:8], str(d.get('src', 'web'))[:8],
+                             tg_user_from_init(str(d.get('init', ''))[:4096]), str(d.get('dev', ''))[:48], ip, bal)
             except Exception as e: log('wallet_seen error', repr(e))
             return self._json(200, {'banned': is_banned_raw(raw)})
         if not TOKEN or self.path != f'/tg/{WEBHOOK_SECRET}' or self.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
